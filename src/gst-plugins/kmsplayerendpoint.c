@@ -80,7 +80,7 @@ typedef struct _KmsPlayerStats
 struct _KmsPlayerEndpointPrivate
 {
   GstElement *pipeline;
-  GstElement *uridecodebin;
+  GstElement *rtspsrc;
   KmsLoop *loop;
   gboolean use_encoded_media;
   gint network_cache;
@@ -166,7 +166,7 @@ kms_pts_data_reset (KmsPtsData * data)
 static void
 kms_player_endpoint_disable_decoding (KmsPlayerEndpoint * self)
 {
-  /* By setting the caps of the uridecodebin element, with all formats
+  /* By setting the caps of the rtspsrc element, with all formats
    * except 'application/x-rtp', what we achieve is that all incoming formats
    * will be passed directly to the media pipeline (as is expected of the
    * 'useEncodedMedia' mode), but incoming RTP streams will still be depayloaded.
@@ -176,7 +176,7 @@ kms_player_endpoint_disable_decoding (KmsPlayerEndpoint * self)
   GstCaps *deco_caps;
 
   deco_caps = gst_caps_from_string (KMS_AGNOSTIC_NO_RTP_CAPS);
-  g_object_set (G_OBJECT (self->priv->uridecodebin), "caps", deco_caps, NULL);
+  g_object_set (G_OBJECT (self->priv->rtspsrc), "caps", deco_caps, NULL);
   gst_caps_unref (deco_caps);
 }
 
@@ -660,7 +660,7 @@ appsrc_query_probe (GstPad * pad, GstPadProbeInfo * info, gpointer element)
 
   if (type == GST_QUERY_CAPS || type == GST_QUERY_ACCEPT_CAPS) {
     query = gst_query_make_writable (query);
-    // Send query upstream to the uridecodebin
+    // Send query upstream to the rtspsrc
     gst_element_query (appsink, query);
     GST_PAD_PROBE_INFO_DATA (info) = query;
   }
@@ -689,8 +689,7 @@ kms_player_end_point_add_appsrc (KmsPlayerEndpoint * self,
   g_object_unref (srcpad);
 
   gst_bin_add (GST_BIN (self), appsrc);
-
-  if (!gst_element_link (appsrc, agnosticbin)) {
+  if (!gst_element_link_many (appsrc, agnosticbin, NULL)) {
     GST_ERROR ("Cannot link elements: %s to %s", GST_ELEMENT_NAME (appsrc),
         GST_ELEMENT_NAME (agnosticbin));
   }
@@ -802,14 +801,14 @@ appsink_probe_query_appsrc_caps (GstPad * pad, GstPadProbeInfo * info,
 }
 
 static GstPadProbeReturn
-appsink_event_query_probe (GstPad * pad, GstPadProbeInfo * info, gpointer element)
+appsink_event_query_probe (GstPad * pad, GstPadProbeInfo * info,
+    gpointer element)
 {
   GstPadProbeType type = GST_PAD_PROBE_INFO_TYPE (info);
 
   if (type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
     return appsink_probe_set_appsrc_caps (pad, info, element);
-  }
-  else if (type & GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM) {
+  } else if (type & GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM) {
     return appsink_probe_query_appsrc_caps (pad, info, element);
   }
 
@@ -859,6 +858,33 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
 
   g_object_set (appsink, "sync", TRUE, "async", TRUE, NULL);
 
+  GstElement *rtph264depay, *h264dec, *videoconvert, *final_capsfilter;
+  GstCaps *final_capsfilter_caps;
+
+  rtph264depay =
+      kms_utils_element_factory_make ("rtph264depay", "kmsplayerendpoint_");
+  h264dec =
+      kms_utils_element_factory_make ("vaapih264dec", "kmsplayerendpoint_");
+  videoconvert =
+      kms_utils_element_factory_make ("videoconvert", "kmsplayerendpoint_");
+  final_capsfilter =
+      kms_utils_element_factory_make ("capsfilter", "kmsplayerendpoint_");
+  final_capsfilter_caps =
+      gst_caps_from_string
+      ("video/x-raw,format=I420,chroma-site=jpeg,colorimetry=1:3:5:1");
+
+  g_object_set (final_capsfilter, "caps", final_capsfilter_caps, NULL);
+  gst_caps_unref (final_capsfilter_caps);
+
+  GstPad *rtp_sink = gst_element_get_static_pad (rtph264depay, "sink");
+  GstPad *final_capsfilter_src =
+      gst_element_get_static_pad (final_capsfilter, "src");
+
+  gst_bin_add_many (GST_BIN (self->priv->pipeline), rtph264depay, h264dec,
+      videoconvert, final_capsfilter, NULL);
+  gst_element_link_many (rtph264depay, h264dec, videoconvert, final_capsfilter,
+      NULL);
+
   sinkpad = gst_element_get_static_pad (appsink, "sink");
 
   if (agnosticbin != NULL) {
@@ -869,7 +895,9 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
 
   gst_bin_add (GST_BIN (self->priv->pipeline), appsink);
 
-  link_ret = gst_pad_link (pad, sinkpad);
+  link_ret = gst_pad_link (final_capsfilter_src, sinkpad);
+
+  gst_pad_link (pad, rtp_sink);
 
   if (GST_PAD_LINK_FAILED (link_ret)) {
     GST_ERROR ("Cannot link elements: %s to %s: %s",
@@ -881,6 +909,10 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
   g_object_unref (sinkpad);
 
   gst_element_sync_state_with_parent (appsink);
+  gst_element_sync_state_with_parent (rtph264depay);
+  gst_element_sync_state_with_parent (h264dec);
+  gst_element_sync_state_with_parent (videoconvert);
+  gst_element_sync_state_with_parent (final_capsfilter);
 }
 
 static void
@@ -930,10 +962,9 @@ kms_player_endpoint_started (KmsUriEndpoint * obj, GError ** error)
   KmsPlayerEndpoint *self = KMS_PLAYER_ENDPOINT (obj);
 
   GST_DEBUG_OBJECT (self, "Pipeline started");
-
-  /* Set uri property in uridecodebin */
-  g_object_set (G_OBJECT (self->priv->uridecodebin), "uri",
-      KMS_URI_ENDPOINT (self)->uri, NULL);
+  /* Set uri property in rtspsrc */
+  g_object_set (G_OBJECT (self->priv->rtspsrc), "location",
+      KMS_URI_ENDPOINT (self)->uri, "latency", 1, NULL);
 
   /* Set internal pipeline to playing */
   gst_element_set_state (self->priv->pipeline, GST_STATE_PLAYING);
@@ -1293,9 +1324,7 @@ kms_player_endpoint_uridecodebin_element_added (GstBin * bin,
               (gst_element_get_factory (element))), RTSPSRC) == 0) {
     g_object_set (G_OBJECT (element),
         "latency", self->priv->network_cache,
-        "drop-on-latency", TRUE,
-        "port-range", self->priv->port_range,
-        NULL);
+        "drop-on-latency", TRUE, "port-range", self->priv->port_range, NULL);
   }
 }
 
@@ -1339,8 +1368,7 @@ process_bus_message (GstBus * bus, GstMessage * msg, KmsPlayerEndpoint * self)
 
   gchar *dot_name = g_strdup_printf ("%s_bus_%d", GST_OBJECT_NAME (self),
       err_code);
-  GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS (GST_BIN (parent), GST_DEBUG_GRAPH_SHOW_ALL,
-      dot_name);
+
   g_free (dot_name);
 
   g_error_free (err);
@@ -1362,8 +1390,12 @@ kms_player_endpoint_init (KmsPlayerEndpoint * self)
 
   self->priv->loop = kms_loop_new ();
   self->priv->pipeline = gst_pipeline_new ("internalpipeline");
-  self->priv->uridecodebin =
-      gst_element_factory_make ("uridecodebin", NULL);
+
+  // this is a workaround to dismiss the vaapidecodebin in case it is installed,
+  // since it does not work together with h264 input
+//  GST_ERROR("Setting vaapidecodebin rank to GST_RANK_NONE");
+//  gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(gst_element_factory_find("vaapidecodebin")), GST_RANK_NONE);
+  self->priv->rtspsrc = gst_element_factory_make ("rtspsrc", NULL);
   self->priv->network_cache = NETWORK_CACHE_DEFAULT;
   self->priv->port_range = g_strdup (PORT_RANGE_DEFAULT);
 
@@ -1371,22 +1403,22 @@ kms_player_endpoint_init (KmsPlayerEndpoint * self)
       (GDestroyNotify) kms_stats_probe_destroy);
 
   /* Connect to signals */
-  g_signal_connect (self->priv->uridecodebin, "pad-added",
+  g_signal_connect (self->priv->rtspsrc, "pad-added",
       G_CALLBACK (kms_player_endpoint_uridecodebin_pad_added), self);
-  g_signal_connect (self->priv->uridecodebin, "pad-removed",
+  g_signal_connect (self->priv->rtspsrc, "pad-removed",
       G_CALLBACK (kms_player_endpoint_uridecodebin_pad_removed), self);
-  g_signal_connect (self->priv->uridecodebin, "source-setup",
+  g_signal_connect (self->priv->rtspsrc, "source-setup",
       G_CALLBACK (kms_player_endpoint_uridecodebin_source_setup), self);
-  g_signal_connect (self->priv->uridecodebin, "element-added",
+  g_signal_connect (self->priv->rtspsrc, "element-added",
       G_CALLBACK (kms_player_endpoint_uridecodebin_element_added), self);
 
   /* Eat all async messages such as buffering messages */
   bus = gst_pipeline_get_bus (GST_PIPELINE (self->priv->pipeline));
   gst_bus_add_watch (bus, (GstBusFunc) process_bus_message, self);
 
-  g_object_set (self->priv->uridecodebin, "download", TRUE, NULL);
+  g_object_set (self->priv->rtspsrc, "download", TRUE, NULL);
 
-  gst_bin_add (GST_BIN (self->priv->pipeline), self->priv->uridecodebin);
+  gst_bin_add (GST_BIN (self->priv->pipeline), self->priv->rtspsrc);
 
   bus = gst_pipeline_get_bus (GST_PIPELINE (self->priv->pipeline));
   gst_bus_set_sync_handler (bus, bus_sync_signal_handler, self, NULL);
