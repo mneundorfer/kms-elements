@@ -823,7 +823,7 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
   GstElement *appsink, *appsrc;
   GstElement *agnosticbin;
   GstPad *sinkpad;
-  GstPadLinkReturn link_ret;
+  GstPadLinkReturn link_ret, link_in;
 
   GST_DEBUG_OBJECT (pad, "Pad added");
 
@@ -869,6 +869,7 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
       kms_utils_element_factory_make ("videoconvert", "kmsplayerendpoint_");
   final_capsfilter =
       kms_utils_element_factory_make ("capsfilter", "kmsplayerendpoint_");
+  // these have to be set explicitly, as automatic negotiation seems to fail...
   final_capsfilter_caps =
       gst_caps_from_string
       ("video/x-raw,format=I420,chroma-site=jpeg,colorimetry=1:3:5:1");
@@ -897,16 +898,26 @@ kms_player_endpoint_uridecodebin_pad_added (GstElement * element, GstPad * pad,
 
   link_ret = gst_pad_link (final_capsfilter_src, sinkpad);
 
-  gst_pad_link (pad, rtp_sink);
-
   if (GST_PAD_LINK_FAILED (link_ret)) {
     GST_ERROR ("Cannot link elements: %s to %s: %s",
-        GST_ELEMENT_NAME (GST_PAD_PARENT (pad)),
+        GST_ELEMENT_NAME (GST_PAD_PARENT (final_capsfilter_src)),
         GST_ELEMENT_NAME (GST_PAD_PARENT (sinkpad)),
         gst_pad_link_get_name (link_ret));
   }
 
+  link_in = gst_pad_link (pad, rtp_sink);
+
+  if (GST_PAD_LINK_FAILED (link_in)) {
+    GST_ERROR ("Cannot link elements: %s to %s: %s",
+        GST_ELEMENT_NAME (GST_PAD_PARENT (pad)),
+        GST_ELEMENT_NAME (GST_PAD_PARENT (rtp_sink)),
+        gst_pad_link_get_name (link_in));
+  }
+
   g_object_unref (sinkpad);
+  g_object_unref (rtp_sink);
+  g_object_unref (final_capsfilter_src);
+  g_object_unref (pad);
 
   gst_element_sync_state_with_parent (appsink);
   gst_element_sync_state_with_parent (rtph264depay);
