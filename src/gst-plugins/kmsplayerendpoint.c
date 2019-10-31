@@ -1383,6 +1383,8 @@ process_bus_message (GstBus * bus, GstMessage * msg, KmsPlayerEndpoint * self)
   gchar *dot_name = g_strdup_printf ("%s_bus_%d", GST_OBJECT_NAME (self),
       err_code);
 
+  GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS (GST_BIN (parent), GST_DEBUG_GRAPH_SHOW_ALL,
+      dot_name);
   g_free (dot_name);
 
   g_error_free (err);
